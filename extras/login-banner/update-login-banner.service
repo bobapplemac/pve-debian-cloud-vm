@@ -1,0 +1,17 @@
+# File:     update-login-banner.service
+# Revision: r1
+# Author:   Andrew J. Moore
+# Source:   https://github.com/bobapplemac/pve-debian-cloud-vm/blob/main/extras/login-banner/update-login-banner.service
+
+[Unit]
+Description=Update console login banner with network information
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/update-login-banner.sh
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
