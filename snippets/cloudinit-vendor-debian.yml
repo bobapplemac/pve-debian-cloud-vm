@@ -1,7 +1,7 @@
 #cloud-config
 #
 # File:        cloudinit-vendor-debian.yml
-# Revision:    r1
+# Revision:    r2
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # Description: Standard vendor cloud-init configuration for Debian Proxmox VMs.
@@ -9,7 +9,6 @@
 #              console, storage-maintenance, and first-boot settings.
 #
 
-# Update package lists and install qemu-guest-agent
 package_update: true
 package_upgrade: true
 
@@ -26,6 +25,7 @@ packages:
 timezone: America/New_York
 
 write_files:
+  # Preserve DHCP client identification by MAC and DHCP-provided DNS/search domains.
   - path: /etc/netplan/99-dhcp-search.yaml
     owner: root:root
     permissions: '0600'
@@ -39,6 +39,20 @@ write_files:
               use-dns: true
               use-domains: true
 
+  # Disable IPv6 configuration at the Netplan/networkd layer.
+  - path: /etc/netplan/99-disable-ipv6.yaml
+    owner: root:root
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp6: false
+            accept-ra: false
+            link-local: [ipv4]
+
+  # Allow root SSH login with password authentication.
   - path: /etc/ssh/sshd_config.d/99-rootlogin.conf
     owner: root:root
     permissions: '0644'
@@ -46,6 +60,7 @@ write_files:
       PermitRootLogin yes
       PasswordAuthentication yes
 
+  # Disable IPv6 at the kernel interface layer.
   - path: /etc/sysctl.d/99-disable-ipv6.conf
     owner: root:root
     permissions: '0644'
@@ -54,6 +69,7 @@ write_files:
       net.ipv6.conf.all.disable_ipv6 = 1
       net.ipv6.conf.default.disable_ipv6 = 1
 
+  # Keep normal boot output quiet and suppress kernel audit messages.
   - path: /etc/default/grub.d/99-local.cfg
     owner: root:root
     permissions: '0644'
@@ -61,31 +77,32 @@ write_files:
       GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT quiet audit=0"
 
 runcmd:
-  # Disable IPv6 immediately and persistently
+  # Apply Netplan first so networkd cannot subsequently undo the IPv6 sysctl state.
+  - netplan apply
+
+  # Apply the persistent IPv6 policy immediately on the first boot.
   - sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
   - sed -E -i '/^[[:space:]]*(::1|ff02::1|ff02::2)([[:space:]]|$)/ s/^([[:space:]]*)/\1# /' /etc/hosts
 
-  # Reduce kernel console verbosity for this initial boot
+  # Reduce kernel console verbosity immediately; GRUB settings apply on subsequent boots.
   - dmesg -n 4
 
-  # Apply networking and SSH configuration
-  - netplan apply
+  # Apply SSH configuration.
   - systemctl restart sshd
 
-  # Disable systemd SSH socket generator
+  # Disable the systemd SSH generator used for vsock/credential-generated SSH units.
   - install -d -m 0755 /etc/systemd/system-generators
   - ln -sfn /dev/null /etc/systemd/system-generators/systemd-ssh-generator
   - systemctl daemon-reload
 
-  # Services
-  - systemctl disable --now systemd-timesyncd.service
+  # Enable standard services and maintenance timers.
   - systemctl enable --now chrony.service
-  - systemctl enable --now qemu-guest-agent.service
+  - systemctl start qemu-guest-agent.service
   - systemctl enable --now cron.service
   - systemctl enable --now fstrim.timer
 
-  # Make quiet/audit settings effective on subsequent boots
+  # Regenerate GRUB configuration with quiet/audit settings.
   - update-grub
 
-  # Prevent cloud-init from running again
+  # This vendor configuration is intended to run once.
   - touch /etc/cloud/cloud-init.disabled
