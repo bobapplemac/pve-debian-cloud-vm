@@ -1,7 +1,7 @@
 #cloud-config
 #
 # File:        cloudinit-vendor-debian.yml
-# Revision:    r6
+# Revision:    r7
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # Source:      https://github.com/bobapplemac/pve-debian-cloud-vm/blob/main/snippets/cloudinit-vendor-debian.yml
@@ -108,6 +108,7 @@ runcmd:
 
   # Set the local FQDN using the DHCP-provided primary search domain.
   - 'd=$(awk ''$1=="search"{print $2;exit}'' /etc/resolv.conf); [ -n "$d" ] && sed -Ei "s|^127\.0\.1\.1[[:space:]].*|127.0.1.1 $(hostname -s).$d $(hostname -s)|" /etc/hosts'
+  - systemctl restart update-login-banner
 
   # Regenerate GRUB configuration with quiet/audit settings.
   - update-grub
