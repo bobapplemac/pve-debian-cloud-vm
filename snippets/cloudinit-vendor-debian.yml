@@ -1,7 +1,7 @@
 #cloud-config
 #
 # File:        cloudinit-vendor-debian.yml
-# Revision:    r3
+# Revision:    r4
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # Description: Standard vendor cloud-init configuration for Debian Proxmox VMs.
@@ -103,7 +103,7 @@ runcmd:
   - systemctl enable --now fstrim.timer
 
   # Custom Login Banner with Hostname and IPv4
-  - curl -fsSL https://raw.githubusercontent.com/bobapplemac/pve-debian-cloud-vm/main/extras/login-banner/install.sh | bash
+  - bash -o pipefail -c 'curl --fail --show-error --location --retry 10 --retry-delay 2 --retry-all-errors https://raw.githubusercontent.com/bobapplemac/pve-debian-cloud-vm/main/extras/login-banner/install.sh | bash'
 
   # Regenerate GRUB configuration with quiet/audit settings.
   - update-grub
