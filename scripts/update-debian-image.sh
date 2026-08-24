@@ -5,7 +5,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        update-debian-image.sh
-# Revision:    r6
+# Revision:    r7
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -31,6 +31,7 @@
 #              IMAGE_VARIANT        Debian cloud image variant. Default: genericcloud
 #              KEEP_IMAGES          Number of cached images to retain. Default: 3
 #              BASE_URL             Override Debian cloud-image base URL.
+#              FORCE_CHECK          Force a remote refresh even if one succeeded today. Default: 0
 #
 # Notes:
 #              Configuration precedence is: built-in defaults < environment < CLI arguments.
@@ -44,6 +45,12 @@
 #              already cached locally. In that case the updater prints a warning and returns
 #              success so VM creation can continue with the newest cached image. Local storage,
 #              configuration, and cache-availability errors remain fatal.
+#
+#              Successful remote refreshes are recorded as timestamp files under:
+#                /var/lib/pve-debian-cloud-vm/update-debian-image/images/
+#              Each extensionless filename identifies an image family. If a usable cached image
+#              exists and its state file was refreshed today, the remote lookup is skipped.
+#              --force-check (or FORCE_CHECK=1) bypasses this once-per-day optimization.
 # ------------------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -59,6 +66,12 @@ IMAGE_ARCH="${IMAGE_ARCH:-amd64}"
 IMAGE_VARIANT="${IMAGE_VARIANT:-genericcloud}"
 KEEP_IMAGES="${KEEP_IMAGES:-3}"
 BASE_URL="${BASE_URL:-}"
+FORCE_CHECK="${FORCE_CHECK:-0}"
+
+STATE_DIR="/var/lib/pve-debian-cloud-vm/update-debian-image"
+IMAGE_STATE_DIR="$STATE_DIR/images"
+IMAGE_KEY=""
+IMAGE_STATE_FILE=""
 
 
 die() {
@@ -78,6 +91,7 @@ Options:
   --image-variant VARIANT     Image variant, e.g. genericcloud
   --keep-images COUNT         Number of images to retain
   --base-url URL              Override Debian cloud-image base URL
+  --force-check               Check Debian even if a successful refresh already occurred today
   -h, --help                  Show this help
 
 Environment variables with matching names may be used instead of CLI arguments.
@@ -130,6 +144,10 @@ parse_args() {
                 BASE_URL=$2
                 shift 2
                 ;;
+            --force-check)
+                FORCE_CHECK=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -145,6 +163,14 @@ parse_args() {
     done
 
     (($# == 0)) || die "Unexpected positional argument: $1"
+}
+
+
+is_true() {
+    case "${1,,}" in
+        1|y|yes|true|on) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 
@@ -220,6 +246,18 @@ continue_with_cached_image() {
 }
 
 
+image_was_refreshed_today() {
+    [[ -f $IMAGE_STATE_FILE ]] || return 1
+    [[ $(date -r "$IMAGE_STATE_FILE" +%F) == "$(date +%F)" ]]
+}
+
+
+record_successful_refresh() {
+    mkdir -p -- "$IMAGE_STATE_DIR"
+    touch -- "$IMAGE_STATE_FILE"
+}
+
+
 # ------------------------------------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------------------------------------
@@ -229,7 +267,7 @@ preflight() {
 
     ((EUID == 0)) || die "Run this script as root."
 
-    for cmd in awk curl grep pvesm sed sort wget; do
+    for cmd in awk curl date grep pvesm sed sort wget; do
         command -v "$cmd" >/dev/null 2>&1 ||
             die "Required command '$cmd' was not found."
     done
@@ -246,6 +284,10 @@ preflight() {
     fi
 
     BASE_URL=${BASE_URL%/}
+
+    # Build the state key only after environment and CLI configuration has been resolved.
+    IMAGE_KEY="debian-${DEBIAN_VERSION}-${DEBIAN_CODENAME}-${IMAGE_VARIANT}-${IMAGE_ARCH}"
+    IMAGE_STATE_FILE="$IMAGE_STATE_DIR/$IMAGE_KEY"
 }
 
 
@@ -281,6 +323,7 @@ prune_old_images() {
 }
 
 update_image() {
+    local cached_volid=""
     local latest_tag
     local qcow_file
     local file_url
@@ -289,8 +332,24 @@ update_image() {
     local target_dir
     local temp_file
 
-    # First try to determine the newest build published by Debian. Network, DNS, TLS, HTTP, or
-    # parsing failures are allowed to fall back to an existing local image.
+    # A usable cached image plus a successful refresh already completed today makes the normal
+    # invocation intentionally cheap. The state timestamp is only written after a successful
+    # remote lookup that either confirms the current image or completes a new download.
+    #
+    # --force-check bypasses this fast path, and the absence of a usable cached image always forces
+    # a remote lookup regardless of the state-file timestamp.
+    cached_volid=$(find_latest_cached_volid || true)
+
+    if [[ -n $cached_volid ]] &&
+       ! is_true "$FORCE_CHECK" &&
+       image_was_refreshed_today; then
+        echo "Debian image already refreshed today; using cached image: $cached_volid"
+        return 0
+    fi
+
+    # Determine the newest build published by Debian. Network, DNS, TLS, HTTP, or parsing failures
+    # are allowed to fall back to an existing local image, but do not update the state timestamp:
+    # a later invocation today should try the remote refresh again.
     if ! latest_tag=$(find_latest_build) || [[ -z $latest_tag ]]; then
         if continue_with_cached_image \
             "Could not determine the latest Debian build at $BASE_URL/."; then
@@ -310,9 +369,12 @@ update_image() {
     mkdir -p -- "$target_dir"
     [[ -w $target_dir ]] || die "Import directory is not writable: $target_dir"
 
+    # The remote lookup succeeded and confirmed that the newest published build is already cached.
+    # Record the successful refresh so later VM creations today can skip the online lookup.
     if [[ -f $target_file ]]; then
         echo "Already up-to-date: $target_volid"
         prune_old_images
+        record_successful_refresh
         return 0
     fi
 
@@ -320,8 +382,9 @@ update_image() {
     echo "Destination: $target_volid"
     rm -f -- "$temp_file"
 
-    # A failed download is also allowed to fall back to a previously cached image. The .part file
-    # is always removed first so an interrupted download can never be mistaken for a usable image.
+    # A failed download may fall back to a previous cached image, but intentionally does not record
+    # a successful refresh. This lets a subsequent invocation retry the download later the same day.
+    # The .part file is always removed so an interrupted download cannot be mistaken for an image.
     if ! wget -O "$temp_file" "$file_url"; then
         rm -f -- "$temp_file"
 
@@ -334,6 +397,7 @@ update_image() {
 
     mv -- "$temp_file" "$target_file"
     prune_old_images
+    record_successful_refresh
 
     echo "Updated Debian image saved as: $target_volid"
 }
