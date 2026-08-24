@@ -8,7 +8,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        install.sh
-# Revision:    r5
+# Revision:    r6
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -30,6 +30,7 @@
 #              mv
 #              pvesm
 #              rm
+#              sha256sum
 #
 # Environment:
 #              IMPORT_STORAGE       Proxmox storage ID for import content. Optional.
@@ -40,7 +41,9 @@
 #                                   Default: /opt/scripts/pve-debian-cloud-vm
 #              COMMAND_LINK         Convenience command symlink.
 #                                   Default: /usr/local/sbin/create-debian-vm
-#              FORCE                Overwrite locally editable files when true. Default: 0
+#              STATE_FILE           Managed-file checksum manifest.
+#                                   Default: <INSTALL_DIR>/.managed-sha256
+#              FORCE                Overwrite locally modified managed files when true. Default: 0
 #              NONINTERACTIVE       Disable interactive storage selection when true. Default: 0
 #
 # Notes:
@@ -54,13 +57,20 @@
 #              normal selection. Import and VM storage may remain unconfigured; snippets storage
 #              is required and installation aborts before writing files if none is available.
 #
-#              build-debian-vm.sh and update-debian-image.sh are generic helper scripts and are
-#              refreshed on every run. create-debian-vm.sh is also refreshed automatically after
-#              carrying forward existing HOST_* settings; the previous launcher is backed up when
-#              its content changes. This allows launcher bug fixes and new features to be installed
-#              without losing host policy. cloudinit-vendor-debian.yml remains locally editable and
-#              is preserved when it differs from the repository version; pass --force to back up
-#              and replace the local snippet.
+#              All four deployed files are managed using SHA-256 checksums recorded in STATE_FILE.
+#              A file that still matches the version last installed by this installer is updated
+#              automatically when the repository version changes. A locally modified file is
+#              preserved and the new repository version is written beside it with a .dist suffix.
+#              Pass --force to back up and replace locally modified files.
+#
+#              For create-debian-vm.sh, the managed checksum intentionally excludes HOST_* assignment
+#              lines. Host defaults therefore remain locally configurable without preventing launcher
+#              logic updates. Existing HOST_* settings are merged into each downloaded launcher before
+#              installation.
+#
+#              When upgrading an installation created before checksum state existed, a differing
+#              existing file is conservatively treated as locally modified. Use --force once to accept
+#              the repository version and establish a managed baseline when appropriate.
 #
 #              Prompts read from /dev/tty so the documented curl-to-bash quick start remains
 #              interactive. In non-interactive mode, snippet storage must be supplied explicitly
@@ -78,6 +88,7 @@ REPO_RAW_BASE="https://raw.githubusercontent.com/bobapplemac/pve-debian-cloud-vm
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/scripts/pve-debian-cloud-vm}"
 COMMAND_LINK="${COMMAND_LINK:-/usr/local/sbin/create-debian-vm}"
+STATE_FILE="${STATE_FILE:-${INSTALL_DIR}/.managed-sha256}"
 IMPORT_STORAGE="${IMPORT_STORAGE:-}"
 SNIPPET_STORAGE="${SNIPPET_STORAGE:-}"
 VM_STORAGE="${VM_STORAGE:-}"
@@ -89,8 +100,10 @@ BUILD_FILE="build-debian-vm.sh"
 UPDATE_FILE="update-debian-image.sh"
 SNIPPET_FILE="cloudinit-vendor-debian.yml"
 
-SNIPPET_PRESERVED=0
 TEMP_DIR=""
+
+declare -a PRESERVED_FILES=()
+declare -a DIST_FILES=()
 
 
 die() {
@@ -109,13 +122,16 @@ Options:
   --vm-storage STORAGE        Proxmox storage ID supporting VM images content
   --install-dir PATH          Script installation directory
   --command-link PATH         Convenience command symlink path
-  --force                     Back up and overwrite the locally edited cloud-init snippet
+  --force                     Back up and overwrite locally modified managed files
   --non-interactive           Do not prompt for storage selection
   -h, --help                  Show this help
 
 Existing valid HOST_*_STORAGE values in the installed create-debian-vm.sh are reused without
 prompting. Otherwise, interactive mode presents compatible storage as a numbered list for each
 role. Import and VM storage may be left unconfigured. Snippet storage is required.
+
+All four deployed files are checksum-managed. Unmodified managed files update automatically;
+local modifications are preserved with the new repository copy written as <file>.dist.
 
 Environment variables with matching names may also be used.
 CLI arguments take precedence over environment variables and existing installed defaults.
@@ -465,73 +481,126 @@ backup_file() {
 }
 
 
-install_generic_script() {
-    local source=$1
-    local destination=$2
+managed_file_hash() {
+    local file=$1
+    local key=$2
 
-    install -o root -g root -m 0755 "$source" "$destination"
-    echo "Installed: $destination"
+    if [[ $key == "$CREATE_FILE" ]]; then
+        # HOST_* values are host policy, not managed launcher logic. Excluding only the actual
+        # assignment lines lets administrators change host defaults without blocking code updates.
+        awk '!/^HOST_[A-Z0-9_]+=/ { print }' "$file" | sha256sum | awk '{ print $1 }'
+    else
+        sha256sum "$file" | awk '{ print $1 }'
+    fi
 }
 
 
-install_host_profile_script() {
-    local source=$1
-    local destination=$2
+read_managed_hash() {
+    local key=$1
 
-    if [[ ! -e $destination ]]; then
-        install -o root -g root -m 0755 "$source" "$destination"
-        rm -f -- "${destination}.dist"
-        echo "Installed: $destination"
-        return 0
-    fi
+    [[ -f $STATE_FILE ]] || return 1
 
-    if cmp -s -- "$source" "$destination"; then
-        rm -f -- "${destination}.dist"
-        echo "Unchanged: $destination"
-        return 0
-    fi
-
-    # The downloaded source has already had existing HOST_* settings merged into it. Back up the
-    # previous launcher, then refresh its implementation automatically so bug fixes are not blocked
-    # merely because the host profile differs from the repository copy.
-    backup_file "$destination"
-    install -o root -g root -m 0755 "$source" "$destination"
-    rm -f -- "${destination}.dist"
-    echo "Updated: $destination"
+    awk -v key="$key" '
+        $2 == key {
+            print $1
+            found = 1
+            exit
+        }
+        END {
+            exit !found
+        }
+    ' "$STATE_FILE"
 }
 
 
-install_editable_file() {
+write_managed_hash() {
+    local key=$1
+    local hash=$2
+    local temp="${STATE_FILE}.tmp.$$"
+
+    if [[ -f $STATE_FILE ]]; then
+        awk -v key="$key" '$2 != key { print }' "$STATE_FILE" > "$temp"
+    else
+        : > "$temp"
+    fi
+
+    printf '%s  %s\n' "$hash" "$key" >> "$temp"
+    install -o root -g root -m 0644 "$temp" "$STATE_FILE"
+    rm -f -- "$temp"
+}
+
+
+install_managed_file() {
     local source=$1
     local destination=$2
     local mode=$3
-    local preserved_variable=$4
+    local key=$4
+
+    local source_hash
+    local current_hash=""
+    local previous_hash=""
+
+    source_hash=$(managed_file_hash "$source" "$key")
 
     if [[ ! -e $destination ]]; then
         install -o root -g root -m "$mode" "$source" "$destination"
+        write_managed_hash "$key" "$source_hash"
         rm -f -- "${destination}.dist"
         echo "Installed: $destination"
         return 0
     fi
 
+    current_hash=$(managed_file_hash "$destination" "$key")
+    previous_hash=$(read_managed_hash "$key" || true)
+
+    # Exact equality is the common no-op path. Recording the hash also adopts an existing file
+    # into checksum management when it already matches the repository-rendered version.
     if cmp -s -- "$source" "$destination"; then
+        write_managed_hash "$key" "$source_hash"
         rm -f -- "${destination}.dist"
         echo "Unchanged: $destination"
+        return 0
+    fi
+
+    # For create-debian-vm.sh this also catches differences limited to HOST_* assignment lines,
+    # allowing installer-selected or locally edited host defaults to be applied safely.
+    if [[ $current_hash == "$source_hash" ]]; then
+        install -o root -g root -m "$mode" "$source" "$destination"
+        write_managed_hash "$key" "$source_hash"
+        rm -f -- "${destination}.dist"
+        echo "Updated host defaults: $destination"
+        return 0
+    fi
+
+    # If the managed portion still matches the last installer baseline, there were no local
+    # modifications to managed content, so a repository update is safe to apply automatically.
+    if [[ -n $previous_hash && $current_hash == "$previous_hash" ]]; then
+        install -o root -g root -m "$mode" "$source" "$destination"
+        write_managed_hash "$key" "$source_hash"
+        rm -f -- "${destination}.dist"
+        echo "Updated: $destination"
         return 0
     fi
 
     if is_true "$FORCE"; then
         backup_file "$destination"
         install -o root -g root -m "$mode" "$source" "$destination"
+        write_managed_hash "$key" "$source_hash"
         rm -f -- "${destination}.dist"
         echo "Updated: $destination"
         return 0
     fi
 
     install -o root -g root -m "$mode" "$source" "${destination}.dist"
-    printf -v "$preserved_variable" '%s' 1
-    echo "Preserved local file: $destination"
-    echo "Repository version:   ${destination}.dist"
+    PRESERVED_FILES+=("$destination")
+    DIST_FILES+=("${destination}.dist")
+
+    if [[ -z $previous_hash ]]; then
+        echo "Preserved untracked existing file: $destination"
+    else
+        echo "Preserved locally modified file: $destination"
+    fi
+    echo "Repository version:            ${destination}.dist"
 }
 
 
@@ -558,7 +627,7 @@ main() {
 
     ((EUID == 0)) || die "Run this script as root."
 
-    for cmd in awk cmp cp curl dirname grep install ln mktemp mv pvesm rm; do
+    for cmd in awk cmp cp curl dirname grep install ln mktemp mv pvesm rm sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 ||
             die "Required command '$cmd' was not found."
     done
@@ -620,10 +689,10 @@ main() {
     install -d -o root -g root -m 0755 "$INSTALL_DIR"
     install -d -o root -g root -m 0755 "$(dirname -- "$snippet_path")"
 
-    install_generic_script "$build_source" "$build_dest"
-    install_generic_script "$update_source" "$update_dest"
-    install_host_profile_script "$create_source" "$create_dest"
-    install_editable_file "$snippet_source" "$snippet_path" 0644 SNIPPET_PRESERVED
+    install_managed_file "$build_source" "$build_dest" 0755 "$BUILD_FILE"
+    install_managed_file "$update_source" "$update_dest" 0755 "$UPDATE_FILE"
+    install_managed_file "$create_source" "$create_dest" 0755 "$CREATE_FILE"
+    install_managed_file "$snippet_source" "$snippet_path" 0644 "$SNIPPET_FILE"
 
     ln -sfn "$snippet_path" "${INSTALL_DIR}/${SNIPPET_FILE}"
 
@@ -636,6 +705,7 @@ main() {
     echo
     echo "  Scripts:         $INSTALL_DIR"
     echo "  Command:         $COMMAND_LINK"
+    echo "  Managed state:   $STATE_FILE"
     echo "  Import storage:  ${IMPORT_STORAGE:-<unconfigured>}"
     echo "  Snippet storage: $SNIPPET_STORAGE"
     echo "  VM storage:      ${VM_STORAGE:-<unconfigured>}"
@@ -647,9 +717,12 @@ main() {
     echo "  $create_dest"
     echo
 
-    if ((SNIPPET_PRESERVED)); then
-        echo "Local ${SNIPPET_FILE} was preserved. Review the new repository version at:"
-        echo "  ${snippet_path}.dist"
+    if ((${#PRESERVED_FILES[@]} > 0)); then
+        echo "Local modifications were preserved:"
+        for i in "${!PRESERVED_FILES[@]}"; do
+            echo "  ${PRESERVED_FILES[$i]}"
+            echo "    repository version: ${DIST_FILES[$i]}"
+        done
         echo
     fi
 
