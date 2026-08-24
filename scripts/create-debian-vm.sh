@@ -5,7 +5,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        create-debian-vm.sh
-# Revision:    r9
+# Revision:    r10
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -17,7 +17,9 @@
 # Requirements:
 #              awk
 #              bash
+#              dirname
 #              pvesm
+#              readlink
 #              update-debian-image.sh
 #              build-debian-vm.sh
 #
@@ -33,6 +35,8 @@
 #              presented interactively, or cause an error in non-interactive mode.
 #
 #              Configuration precedence is: Host Configuration < environment < CLI arguments.
+#              The script resolves its real path before locating sibling helper scripts, so it may
+#              be invoked through a symlink such as /usr/local/sbin/create-debian-vm.
 #              Unknown VM-specific arguments are passed through unchanged to build-debian-vm.sh.
 # ------------------------------------------------------------------------------------------
 
@@ -131,7 +135,8 @@ ROOT_PASSWORD_HASH="${ROOT_PASSWORD_HASH-$HOST_ROOT_PASSWORD_HASH}"
 # Provisioning Configuration
 # ------------------------------------------------------------------------------------------
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname -- "$SCRIPT_PATH")
 UPDATE_SCRIPT="${UPDATE_SCRIPT:-$SCRIPT_DIR/update-debian-image.sh}"
 BUILD_SCRIPT="${BUILD_SCRIPT:-$SCRIPT_DIR/build-debian-vm.sh}"
 SKIP_UPDATE="${SKIP_UPDATE:-0}"
