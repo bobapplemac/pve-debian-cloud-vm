@@ -8,7 +8,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        install.sh
-# Revision:    r2
+# Revision:    r4
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -33,7 +33,8 @@
 #
 # Environment:
 #              IMPORT_STORAGE       Proxmox storage ID for import content. Optional.
-#              SNIPPET_STORAGE      Proxmox storage ID for snippets content. Required.
+#              SNIPPET_STORAGE      Proxmox storage ID for snippets content. Required unless a
+#                                   valid value already exists in installed create-debian-vm.sh.
 #              VM_STORAGE           Proxmox storage ID for VM image content. Optional.
 #              INSTALL_DIR          Script installation directory.
 #                                   Default: /opt/scripts/pve-debian-cloud-vm
@@ -46,21 +47,25 @@
 #              The canonical GitHub filenames do not contain revision suffixes; revisions are
 #              retained only in each file's comment header.
 #
-#              In interactive mode, storage is never selected implicitly. The installer presents
-#              numbered lists for import, snippets, and VM image storage even when only one valid
-#              storage is available. Import and VM storage may be left unconfigured; snippets
-#              storage is required and installation aborts before writing files if none is
-#              available or selected.
+#              Storage selection precedence is: explicit environment/CLI value <existing installed
+#              create-debian-vm.sh host default> <interactive selection>. Existing HOST_*_STORAGE
+#              values are reused without prompting when they remain active, enabled, and support
+#              the required content type. Invalid or blank existing values fall back to normal
+#              selection. Import and VM storage may remain unconfigured; snippets storage is
+#              required and installation aborts before writing files if none is available.
 #
 #              build-debian-vm.sh and update-debian-image.sh are generic helper scripts and are
 #              refreshed on every run. create-debian-vm.sh and cloudinit-vendor-debian.yml are
 #              locally editable and are preserved when they differ from the current repository
 #              versions. Updated repository copies are written beside them with a .dist suffix.
-#              Pass --force to back up and replace locally edited copies.
+#              Pass --force to back up and replace locally edited copies. Existing non-storage
+#              HOST_* settings are carried into the replacement create-debian-vm.sh; storage
+#              defaults come from the selections made during the current installer run.
 #
 #              Prompts read from /dev/tty so the documented curl-to-bash quick start remains
-#              interactive. In non-interactive mode, SNIPPET_STORAGE must be supplied explicitly;
-#              IMPORT_STORAGE and VM_STORAGE may remain blank.
+#              interactive. In non-interactive mode, snippet storage must be supplied explicitly
+#              or already be valid in the installed create-debian-vm.sh; import and VM storage may
+#              remain blank.
 # ------------------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -109,11 +114,12 @@ Options:
   --non-interactive           Do not prompt for storage selection
   -h, --help                  Show this help
 
-In interactive mode, compatible storage is presented as a numbered list for each role.
-Import and VM storage may be left unconfigured. Snippet storage is required.
+Existing valid HOST_*_STORAGE values in the installed create-debian-vm.sh are reused without
+prompting. Otherwise, interactive mode presents compatible storage as a numbered list for each
+role. Import and VM storage may be left unconfigured. Snippet storage is required.
 
 Environment variables with matching names may also be used.
-CLI arguments take precedence over environment variables.
+CLI arguments take precedence over environment variables and existing installed defaults.
 USAGE
 }
 
@@ -207,6 +213,58 @@ list_active_storages_for_content() {
 
     pvesm status --content "$content" --enabled 1 2>/dev/null \
         | awk 'NR > 1 && $3 == "active" { print $1 }'
+}
+
+
+read_existing_host_storage_default() {
+    local file=$1
+    local key=$2
+    local line
+    local value
+
+    [[ -f $file ]] || return 1
+
+    line=$(grep -m1 "^${key}=" "$file" || true)
+    [[ -n $line ]] || return 1
+
+    value=${line#*=}
+
+    if [[ $value =~ ^\"([^\"]*)\"$ ]]; then
+        value=${BASH_REMATCH[1]}
+    elif [[ $value =~ ^\'([^\']*)\'$ ]]; then
+        value=${BASH_REMATCH[1]}
+    elif [[ $value =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        :
+    else
+        return 1
+    fi
+
+    [[ -n $value ]] || return 1
+    printf '%s\n' "$value"
+}
+
+
+reuse_existing_storage_default() {
+    local variable_name=$1
+    local key=$2
+    local content=$3
+    local label=$4
+    local create_file=$5
+    local current_value=${!variable_name}
+    local existing_value
+
+    # An explicit environment or CLI value always takes precedence.
+    [[ -z $current_value ]] || return 0
+
+    existing_value=$(read_existing_host_storage_default "$create_file" "$key" || true)
+    [[ -n $existing_value ]] || return 0
+
+    if storage_is_active_with_content "$existing_value" "$content"; then
+        printf -v "$variable_name" '%s' "$existing_value"
+        echo "Using $label storage: $existing_value (existing create-debian-vm.sh)"
+    else
+        echo "Existing $key='$existing_value' is not currently valid for content type '$content'; selecting again."
+    fi
 }
 
 
@@ -321,6 +379,44 @@ download_file() {
     echo "Downloading: $url"
     curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$destination" ||
         die "Download failed: $url"
+}
+
+
+preserve_existing_host_defaults() {
+    local existing=$1
+    local source=$2
+    local temp="${source}.host-defaults"
+
+    [[ -f $existing ]] || return 0
+
+    # Preserve host-specific settings from an existing create-debian-vm.sh while allowing the
+    # installer-selected storage defaults to be applied separately below. This is especially useful
+    # with --force, which can then refresh launcher logic without discarding local host policy.
+    awk '
+        NR == FNR {
+            if ($0 ~ /^HOST_[A-Z0-9_]+=/) {
+                split($0, parts, "=")
+                key = parts[1]
+                if (key != "HOST_IMPORT_STORAGE" &&
+                    key != "HOST_SNIPPET_STORAGE" &&
+                    key != "HOST_VM_STORAGE") {
+                    saved[key] = $0
+                }
+            }
+            next
+        }
+        $0 ~ /^HOST_[A-Z0-9_]+=/ {
+            split($0, parts, "=")
+            key = parts[1]
+            if (key in saved) {
+                print saved[key]
+                next
+            }
+        }
+        { print }
+    ' "$existing" "$source" > "$temp"
+
+    mv -- "$temp" "$source"
 }
 
 
@@ -444,8 +540,16 @@ main() {
 
     pvesm status >/dev/null 2>&1 || die "Could not query Proxmox storage. Run this on a Proxmox VE host."
 
-    # Resolve all storage choices before downloading or installing anything. Snippet storage is
-    # required; import and VM storage are optional host defaults and may remain blank.
+    create_dest="${INSTALL_DIR}/${CREATE_FILE}"
+
+    # Reuse valid storage defaults from an existing installed host profile unless explicitly
+    # overridden by environment or CLI. This avoids prompting again on normal installer reruns.
+    reuse_existing_storage_default IMPORT_STORAGE HOST_IMPORT_STORAGE import "Debian cloud-image import" "$create_dest"
+    reuse_existing_storage_default SNIPPET_STORAGE HOST_SNIPPET_STORAGE snippets "cloud-init snippet" "$create_dest"
+    reuse_existing_storage_default VM_STORAGE HOST_VM_STORAGE images "VM image" "$create_dest"
+
+    # Resolve any remaining storage choices before downloading or installing anything. Snippet
+    # storage is required; import and VM storage are optional host defaults and may remain blank.
     resolve_storage_selection IMPORT_STORAGE import "Debian cloud-image import" 0
     resolve_storage_selection SNIPPET_STORAGE snippets "cloud-init snippet" 1
     resolve_storage_selection VM_STORAGE images "VM image" 0
@@ -469,11 +573,15 @@ main() {
     update_source="${temp_dir}/${UPDATE_FILE}"
     snippet_source="${temp_dir}/${SNIPPET_FILE}"
 
+    build_dest="${INSTALL_DIR}/${BUILD_FILE}"
+    update_dest="${INSTALL_DIR}/${UPDATE_FILE}"
+
     download_file "${REPO_RAW_BASE}/scripts/${CREATE_FILE}" "$create_source"
     download_file "${REPO_RAW_BASE}/scripts/${BUILD_FILE}" "$build_source"
     download_file "${REPO_RAW_BASE}/scripts/${UPDATE_FILE}" "$update_source"
     download_file "${REPO_RAW_BASE}/snippets/${SNIPPET_FILE}" "$snippet_source"
 
+    preserve_existing_host_defaults "$create_dest" "$create_source"
     patch_create_storage_defaults "$create_source"
 
     bash -n "$create_source" || die "Downloaded ${CREATE_FILE} failed bash syntax validation."
@@ -486,10 +594,6 @@ main() {
 
     install -d -o root -g root -m 0755 "$INSTALL_DIR"
     install -d -o root -g root -m 0755 "$(dirname -- "$snippet_path")"
-
-    create_dest="${INSTALL_DIR}/${CREATE_FILE}"
-    build_dest="${INSTALL_DIR}/${BUILD_FILE}"
-    update_dest="${INSTALL_DIR}/${UPDATE_FILE}"
 
     install_generic_script "$build_source" "$build_dest"
     install_generic_script "$update_source" "$update_dest"
