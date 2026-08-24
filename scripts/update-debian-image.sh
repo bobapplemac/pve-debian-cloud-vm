@@ -5,7 +5,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        update-debian-image.sh
-# Revision:    r5
+# Revision:    r6
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -39,6 +39,11 @@
 #              Physical paths are resolved by Proxmox with pvesm rather than hardcoded.
 #              Downloads are written to a temporary .part file and renamed only after wget
 #              completes successfully. Existing current images are not downloaded again.
+#
+#              Remote lookup or download failures are non-fatal when a usable matching image is
+#              already cached locally. In that case the updater prints a warning and returns
+#              success so VM creation can continue with the newest cached image. Local storage,
+#              configuration, and cache-availability errors remain fatal.
 # ------------------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -184,6 +189,37 @@ resolve_import_path() {
 }
 
 
+find_latest_cached_volid() {
+    local -a volids=()
+    local volid
+    local path
+
+    mapfile -t volids < <(list_matching_import_volids | sort -r)
+
+    for volid in "${volids[@]}"; do
+        path=$(pvesm path "$volid" 2>/dev/null || true)
+        [[ -n $path && -f $path ]] || continue
+
+        printf '%s\n' "$volid"
+        return 0
+    done
+
+    return 1
+}
+
+
+continue_with_cached_image() {
+    local reason=$1
+    local cached_volid
+
+    cached_volid=$(find_latest_cached_volid) || return 1
+
+    echo "WARNING: $reason" >&2
+    echo "WARNING: Continuing with newest cached image: $cached_volid" >&2
+    return 0
+}
+
+
 # ------------------------------------------------------------------------------------------
 # Preflight
 # ------------------------------------------------------------------------------------------
@@ -253,8 +289,16 @@ update_image() {
     local target_dir
     local temp_file
 
-    latest_tag=$(find_latest_build)
-    [[ -n $latest_tag ]] || die "Could not find the latest Debian build directory at $BASE_URL/."
+    # First try to determine the newest build published by Debian. Network, DNS, TLS, HTTP, or
+    # parsing failures are allowed to fall back to an existing local image.
+    if ! latest_tag=$(find_latest_build) || [[ -z $latest_tag ]]; then
+        if continue_with_cached_image \
+            "Could not determine the latest Debian build at $BASE_URL/."; then
+            return 0
+        fi
+
+        die "Could not determine the latest Debian build at $BASE_URL/, and no usable cached Debian ${DEBIAN_VERSION} ${IMAGE_VARIANT} ${IMAGE_ARCH} image is available."
+    fi
 
     qcow_file="debian-${DEBIAN_VERSION}-${IMAGE_VARIANT}-${IMAGE_ARCH}-${latest_tag}.qcow2"
     file_url="${BASE_URL}/${latest_tag}/${qcow_file}"
@@ -276,9 +320,16 @@ update_image() {
     echo "Destination: $target_volid"
     rm -f -- "$temp_file"
 
+    # A failed download is also allowed to fall back to a previously cached image. The .part file
+    # is always removed first so an interrupted download can never be mistaken for a usable image.
     if ! wget -O "$temp_file" "$file_url"; then
         rm -f -- "$temp_file"
-        die "Download failed: $file_url"
+
+        if continue_with_cached_image "Download failed: $file_url"; then
+            return 0
+        fi
+
+        die "Download failed: $file_url, and no usable cached Debian ${DEBIAN_VERSION} ${IMAGE_VARIANT} ${IMAGE_ARCH} image is available."
     fi
 
     mv -- "$temp_file" "$target_file"
