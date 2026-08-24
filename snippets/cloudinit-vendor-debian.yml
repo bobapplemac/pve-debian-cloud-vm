@@ -1,0 +1,91 @@
+#cloud-config
+#
+# File:        cloudinit-vendor-debian.yml
+# Revision:    r1
+# Modified:    2026-08-24
+# Author:      Andrew J. Moore
+# Description: Standard vendor cloud-init configuration for Debian Proxmox VMs.
+#              Applies baseline packages, networking, SSH, time sync, IPv6,
+#              console, storage-maintenance, and first-boot settings.
+#
+
+# Update package lists and install qemu-guest-agent
+package_update: true
+package_upgrade: true
+
+packages:
+  - qemu-guest-agent
+  - parted
+  - gdisk
+  - btop
+  - cron
+  - curl
+  - chrony
+  - xfsprogs
+
+timezone: America/New_York
+
+write_files:
+  - path: /etc/netplan/99-dhcp-search.yaml
+    owner: root:root
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp-identifier: mac
+            dhcp4-overrides:
+              use-dns: true
+              use-domains: true
+
+  - path: /etc/ssh/sshd_config.d/99-rootlogin.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+
+  - path: /etc/sysctl.d/99-disable-ipv6.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # IPv6 disabled by cloud-init
+      net.ipv6.conf.all.disable_ipv6 = 1
+      net.ipv6.conf.default.disable_ipv6 = 1
+
+  - path: /etc/default/grub.d/99-local.cfg
+    owner: root:root
+    permissions: '0644'
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT quiet audit=0"
+
+runcmd:
+  # Disable IPv6 immediately and persistently
+  - sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+  - sed -E -i '/^[[:space:]]*(::1|ff02::1|ff02::2)([[:space:]]|$)/ s/^([[:space:]]*)/\1# /' /etc/hosts
+
+  # Reduce kernel console verbosity for this initial boot
+  - dmesg -n 4
+
+  # Apply networking and SSH configuration
+  - netplan apply
+  - systemctl restart sshd
+
+  # Disable systemd SSH socket generator
+  - install -d -m 0755 /etc/systemd/system-generators
+  - ln -sfn /dev/null /etc/systemd/system-generators/systemd-ssh-generator
+  - systemctl daemon-reload
+
+  # Services
+  - systemctl disable --now systemd-timesyncd.service
+  - systemctl enable --now chrony.service
+  - systemctl enable --now qemu-guest-agent.service
+  - systemctl enable --now cron.service
+  - systemctl enable --now fstrim.timer
+
+  # Make quiet/audit settings effective on subsequent boots
+  - update-grub
+
+  # Prevent cloud-init from running again
+  - touch /etc/cloud/cloud-init.disabled
