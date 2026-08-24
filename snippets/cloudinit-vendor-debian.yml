@@ -1,9 +1,10 @@
 #cloud-config
 #
 # File:        cloudinit-vendor-debian.yml
-# Revision:    r4
+# Revision:    r5
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
+# Source:      https://github.com/bobapplemac/pve-debian-cloud-vm/blob/main/snippets/cloudinit-vendor-debian.yml
 # Description: Standard vendor cloud-init configuration for Debian Proxmox VMs.
 #              Applies baseline packages, networking, SSH, time sync, IPv6,
 #              console, storage-maintenance, and first-boot settings.
