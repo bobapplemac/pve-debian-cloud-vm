@@ -8,7 +8,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        install.sh
-# Revision:    r4
+# Revision:    r5
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -47,20 +47,20 @@
 #              The canonical GitHub filenames do not contain revision suffixes; revisions are
 #              retained only in each file's comment header.
 #
-#              Storage selection precedence is: explicit environment/CLI value <existing installed
-#              create-debian-vm.sh host default> <interactive selection>. Existing HOST_*_STORAGE
-#              values are reused without prompting when they remain active, enabled, and support
-#              the required content type. Invalid or blank existing values fall back to normal
-#              selection. Import and VM storage may remain unconfigured; snippets storage is
-#              required and installation aborts before writing files if none is available.
+#              Explicit environment/CLI storage values override valid defaults from an existing
+#              installed create-debian-vm.sh; existing defaults in turn avoid interactive selection.
+#              Existing HOST_*_STORAGE values are reused when they remain active, enabled, and
+#              support the required content type. Invalid or blank existing values fall back to
+#              normal selection. Import and VM storage may remain unconfigured; snippets storage
+#              is required and installation aborts before writing files if none is available.
 #
 #              build-debian-vm.sh and update-debian-image.sh are generic helper scripts and are
-#              refreshed on every run. create-debian-vm.sh and cloudinit-vendor-debian.yml are
-#              locally editable and are preserved when they differ from the current repository
-#              versions. Updated repository copies are written beside them with a .dist suffix.
-#              Pass --force to back up and replace locally edited copies. Existing non-storage
-#              HOST_* settings are carried into the replacement create-debian-vm.sh; storage
-#              defaults come from the selections made during the current installer run.
+#              refreshed on every run. create-debian-vm.sh is also refreshed automatically after
+#              carrying forward existing HOST_* settings; the previous launcher is backed up when
+#              its content changes. This allows launcher bug fixes and new features to be installed
+#              without losing host policy. cloudinit-vendor-debian.yml remains locally editable and
+#              is preserved when it differs from the repository version; pass --force to back up
+#              and replace the local snippet.
 #
 #              Prompts read from /dev/tty so the documented curl-to-bash quick start remains
 #              interactive. In non-interactive mode, snippet storage must be supplied explicitly
@@ -89,7 +89,6 @@ BUILD_FILE="build-debian-vm.sh"
 UPDATE_FILE="update-debian-image.sh"
 SNIPPET_FILE="cloudinit-vendor-debian.yml"
 
-CREATE_PRESERVED=0
 SNIPPET_PRESERVED=0
 TEMP_DIR=""
 
@@ -110,7 +109,7 @@ Options:
   --vm-storage STORAGE        Proxmox storage ID supporting VM images content
   --install-dir PATH          Script installation directory
   --command-link PATH         Convenience command symlink path
-  --force                     Back up and overwrite locally editable files
+  --force                     Back up and overwrite the locally edited cloud-init snippet
   --non-interactive           Do not prompt for storage selection
   -h, --help                  Show this help
 
@@ -261,7 +260,6 @@ reuse_existing_storage_default() {
 
     if storage_is_active_with_content "$existing_value" "$content"; then
         printf -v "$variable_name" '%s' "$existing_value"
-        echo "Using $label storage: $existing_value (existing create-debian-vm.sh)"
     else
         echo "Existing $key='$existing_value' is not currently valid for content type '$content'; selecting again."
     fi
@@ -295,7 +293,7 @@ resolve_storage_selection() {
     if [[ -n $current_value ]]; then
         storage_is_active_with_content "$current_value" "$content" ||
             die "Storage '$current_value' is not active and enabled with content type '$content'."
-        echo "Using $label storage: $current_value (specified)"
+        echo "Using $label storage: $current_value (configured)"
         return 0
     fi
 
@@ -476,6 +474,33 @@ install_generic_script() {
 }
 
 
+install_host_profile_script() {
+    local source=$1
+    local destination=$2
+
+    if [[ ! -e $destination ]]; then
+        install -o root -g root -m 0755 "$source" "$destination"
+        rm -f -- "${destination}.dist"
+        echo "Installed: $destination"
+        return 0
+    fi
+
+    if cmp -s -- "$source" "$destination"; then
+        rm -f -- "${destination}.dist"
+        echo "Unchanged: $destination"
+        return 0
+    fi
+
+    # The downloaded source has already had existing HOST_* settings merged into it. Back up the
+    # previous launcher, then refresh its implementation automatically so bug fixes are not blocked
+    # merely because the host profile differs from the repository copy.
+    backup_file "$destination"
+    install -o root -g root -m 0755 "$source" "$destination"
+    rm -f -- "${destination}.dist"
+    echo "Updated: $destination"
+}
+
+
 install_editable_file() {
     local source=$1
     local destination=$2
@@ -597,7 +622,7 @@ main() {
 
     install_generic_script "$build_source" "$build_dest"
     install_generic_script "$update_source" "$update_dest"
-    install_editable_file "$create_source" "$create_dest" 0755 CREATE_PRESERVED
+    install_host_profile_script "$create_source" "$create_dest"
     install_editable_file "$snippet_source" "$snippet_path" 0644 SNIPPET_PRESERVED
 
     ln -sfn "$snippet_path" "${INSTALL_DIR}/${SNIPPET_FILE}"
@@ -618,15 +643,9 @@ main() {
     echo "  Snippet path:    $snippet_path"
     echo
 
-    if ((CREATE_PRESERVED)); then
-        echo "Local ${CREATE_FILE} was preserved. Review the new repository version at:"
-        echo "  ${create_dest}.dist"
-        echo
-    else
-        echo "Configure any remaining host defaults in:"
-        echo "  $create_dest"
-        echo
-    fi
+    echo "Configure or review host defaults in:"
+    echo "  $create_dest"
+    echo
 
     if ((SNIPPET_PRESERVED)); then
         echo "Local ${SNIPPET_FILE} was preserved. Review the new repository version at:"
