@@ -5,7 +5,7 @@
 #
 # ------------------------------------------------------------------------------------------
 # File:        create-debian-vm.sh
-# Revision:    r10
+# Revision:    r11
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # License:     Zero-Clause BSD (0BSD)
@@ -110,7 +110,7 @@ HOST_DEFAULT_VLAN=""
 HOST_DISK_OPTIONS=""
 
 HOST_ROOT_PASSWORD=""
-HOST_ROOT_PASSWORD_HASH=""
+HOST_ROOT_PASSWORD_HASH=''
 
 # Runtime values. Environment variables override the configured host defaults. The '-' form is
 # intentional: explicitly exporting an empty storage variable requests automatic discovery.
