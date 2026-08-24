@@ -1,7 +1,7 @@
 #cloud-config
 #
 # File:        cloudinit-vendor-debian.yml
-# Revision:    r2
+# Revision:    r3
 # Modified:    2026-08-24
 # Author:      Andrew J. Moore
 # Description: Standard vendor cloud-init configuration for Debian Proxmox VMs.
@@ -21,6 +21,7 @@ packages:
   - curl
   - chrony
   - xfsprogs
+  - inotify-tools
 
 timezone: America/New_York
 
@@ -100,6 +101,9 @@ runcmd:
   - systemctl start qemu-guest-agent.service
   - systemctl enable --now cron.service
   - systemctl enable --now fstrim.timer
+
+  # Custom Login Banner with Hostname and IPv4
+  - curl -fsSL https://raw.githubusercontent.com/bobapplemac/pve-debian-cloud-vm/main/extras/login-banner/install.sh | bash
 
   # Regenerate GRUB configuration with quiet/audit settings.
   - update-grub
